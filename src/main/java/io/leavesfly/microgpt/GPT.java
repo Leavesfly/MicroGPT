@@ -53,6 +53,19 @@ public class GPT {
      * @param blockSize 最大序列长度
      */
     public GPT(int vocabSize, int nEmbd, int nHead, int nLayer, int blockSize) {
+        this(vocabSize, nEmbd, nHead, nLayer, blockSize, true);
+    }
+
+    /**
+     * 构造函数（支持静默模式）
+     * @param vocabSize 词表大小
+     * @param nEmbd 嵌入维度
+     * @param nHead 注意力头数量
+     * @param nLayer Transformer 层数
+     * @param blockSize 最大序列长度
+     * @param verbose 是否打印初始化信息
+     */
+    public GPT(int vocabSize, int nEmbd, int nHead, int nLayer, int blockSize, boolean verbose) {
         this.vocabSize = vocabSize;
         this.nEmbd = nEmbd;
         this.nHead = nHead;
@@ -64,7 +77,9 @@ public class GPT {
         // 初始化模型参数
         initializeParameters();
         
-        System.out.println("模型参数数量: " + params.size());
+        if (verbose) {
+            System.out.println("模型参数数量: " + params.size());
+        }
     }
     
     /**
@@ -361,5 +376,49 @@ public class GPT {
             cache.add(new ArrayList<>());
         }
         return cache;
+    }
+
+    /**
+     * 深拷贝模型（用于 PPO 中的 Reference Model）
+     * 拷贝后的模型参数值相同，但拥有独立的 Value 节点，不共享计算图。
+     *
+     * @return 深拷贝后的 GPT 模型
+     */
+    public GPT cloneModel() {
+        GPT cloned = new GPT(vocabSize, nEmbd, nHead, nLayer, blockSize, false);
+
+        for (Map.Entry<String, Value[][]> entry : this.stateDict.entrySet()) {
+            String key = entry.getKey();
+            Value[][] srcMatrix = entry.getValue();
+            Value[][] dstMatrix = cloned.stateDict.get(key);
+
+            for (int i = 0; i < srcMatrix.length; i++) {
+                for (int j = 0; j < srcMatrix[i].length; j++) {
+                    dstMatrix[i][j] = new Value(srcMatrix[i][j].data);
+                }
+            }
+        }
+
+        // 重新构建扁平化参数列表
+        cloned.params = new ArrayList<>();
+        for (Value[][] matrix : cloned.stateDict.values()) {
+            for (Value[] row : matrix) {
+                Collections.addAll(cloned.params, row);
+            }
+        }
+
+        return cloned;
+    }
+
+    /**
+     * 从另一个模型同步参数值（用于 PPO 中定期更新 Reference Model）
+     *
+     * @param source 源模型
+     */
+    public void syncParamsFrom(GPT source) {
+        List<Value> srcParams = source.getParams();
+        for (int i = 0; i < this.params.size(); i++) {
+            this.params.get(i).data = srcParams.get(i).data;
+        }
     }
 }

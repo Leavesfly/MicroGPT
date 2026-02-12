@@ -57,11 +57,49 @@ public class MicroGPT {
      */
     private static final int NUM_SAMPLES = 20;
 
+    // ============ PPO 后训练超参数 ============
+
+    /**
+     * PPO 训练步数
+     */
+    private static final int PPO_STEPS = 200;
+
+    /**
+     * 每步生成的 rollout 数量（越大梯度估计越准确）
+     */
+    private static final int PPO_ROLLOUTS_PER_STEP = 8;
+
+    /**
+     * PPO clip 范围 ε（控制每步更新幅度）
+     */
+    private static final double PPO_CLIP_EPSILON = 0.2;
+
+    /**
+     * KL 散度惩罚系数 β（越小允许策略探索越多）
+     */
+    private static final double PPO_KL_COEFFICIENT = 0.05;
+
+    /**
+     * PPO 学习率
+     */
+    private static final double PPO_LEARNING_RATE = 1e-3;
+
+    /**
+     * PPO 推理温度
+     */
+    private static final double PPO_TEMPERATURE = 0.8;
+
+    /**
+     * Reference model 同步间隔
+     */
+    private static final int PPO_REF_SYNC_INTERVAL = 25;
+
     // ============ 核心组件 ============
 
     private Tokenizer tokenizer;
     private GPT model;
     private AdamOptimizer optimizer;
+    private PPOTrainer ppoTrainer;
     private List<String> docs;
     private Random random;
 
@@ -103,8 +141,14 @@ public class MicroGPT {
         // 6. 训练模型
         train();
 
-        // 7. 训练后推理生成
+        // 7. 预训练后推理生成
         inference();
+
+        // 8. PPO 后训练（强化学习）
+        ppoPostTrain();
+
+        // 9. PPO 后训练推理生成
+        ppoInference();
     }
 
     /**
@@ -343,6 +387,34 @@ public class MicroGPT {
 
             System.out.printf("sample %2d: %s%n", sampleIdx + 1, output.toString());
         }
+    }
+
+    /**
+     * PPO 后训练（强化学习阶段）
+     * 在预训练完成后，使用 PPO 算法进一步优化模型
+     */
+    private void ppoPostTrain() {
+        RewardFunction rewardFunction = new RewardFunction(docs);
+
+        PPOTrainer.Config ppoConfig = new PPOTrainer.Config();
+        ppoConfig.ppoSteps = PPO_STEPS;
+        ppoConfig.rolloutsPerStep = PPO_ROLLOUTS_PER_STEP;
+        ppoConfig.clipEpsilon = PPO_CLIP_EPSILON;
+        ppoConfig.klCoefficient = PPO_KL_COEFFICIENT;
+        ppoConfig.learningRate = PPO_LEARNING_RATE;
+        ppoConfig.temperature = PPO_TEMPERATURE;
+        ppoConfig.refSyncInterval = PPO_REF_SYNC_INTERVAL;
+
+        ppoTrainer = new PPOTrainer(model, rewardFunction, tokenizer, ppoConfig);
+        ppoTrainer.train();
+    }
+
+    /**
+     * PPO 后训练推理生成
+     * 展示 PPO 后训练后的模型生成效果
+     */
+    private void ppoInference() {
+        ppoTrainer.generateSamples(NUM_SAMPLES, TEMPERATURE);
     }
 
     /**

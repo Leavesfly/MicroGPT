@@ -154,6 +154,31 @@ public class Value {
     }
     
     /**
+     * Sigmoid 激活函数
+     * σ(x) = 1 / (1 + exp(-x))
+     */
+    public Value sigmoid() {
+        double sigVal = 1.0 / (1.0 + Math.exp(-this.data));
+        Value out = new Value(sigVal, List.of(this), "sigmoid");
+
+        Consumer<Void> backwardFn = (v) -> {
+            this.grad += sigVal * (1.0 - sigVal) * out.grad;
+        };
+        out.setBackward(backwardFn);
+
+        return out;
+    }
+
+    /**
+     * 截断计算图（detach）
+     * 返回一个与当前值相同但不参与梯度计算的新 Value 节点
+     * 用于 PPO 中冻结 reference model 的输出
+     */
+    public Value detach() {
+        return new Value(this.data);
+    }
+
+    /**
      * ReLU 激活函数
      */
     public Value relu() {
