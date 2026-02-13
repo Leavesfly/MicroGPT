@@ -2,6 +2,8 @@ package io.leavesfly.microgpt;
 
 import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.util.*;
 
 /**
@@ -161,12 +163,12 @@ public class Tokenizer {
     public static List<String> loadDataset(String resourceName) {
         List<String> docs = new ArrayList<>();
 
-        try (java.io.InputStream inputStream = Tokenizer.class.getClassLoader().getResourceAsStream(resourceName)) {
+        try (InputStream inputStream = Tokenizer.class.getClassLoader().getResourceAsStream(resourceName)) {
             if (inputStream == null) {
                 System.err.println("资源文件未找到: " + resourceName);
                 return docs;
             }
-            try (BufferedReader reader = new BufferedReader(new java.io.InputStreamReader(inputStream, "UTF-8"))) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, "UTF-8"))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     line = line.trim();
