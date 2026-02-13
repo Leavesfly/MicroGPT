@@ -94,12 +94,35 @@ public class MicroGPT {
      */
     private static final int PPO_REF_SYNC_INTERVAL = 25;
 
+    // ============ DPO 后训练超参数 ============
+
+    /**
+     * DPO 训练轮数
+     */
+    private static final int DPO_EPOCHS = 100;
+
+    /**
+     * DPO 批次大小
+     */
+    private static final int DPO_BATCH_SIZE = 16;
+
+    /**
+     * DPO KL 惩罚系数 β
+     */
+    private static final double DPO_BETA = 0.1;
+
+    /**
+     * DPO 学习率
+     */
+    private static final double DPO_LEARNING_RATE = 5e-4;
+
     // ============ 核心组件 ============
 
     private Tokenizer tokenizer;
     private GPT model;
     private AdamOptimizer optimizer;
     private PPOTrainer ppoTrainer;
+    private DPOTrainer dpoTrainer;
     private List<String> docs;
     private Random random;
 
@@ -149,6 +172,12 @@ public class MicroGPT {
 
         // 9. PPO 后训练推理生成
         ppoInference();
+
+        // 10. DPO 后训练（直接偏好优化）
+        dpoPostTrain();
+
+        // 11. DPO 后训练推理生成
+        dpoInference();
     }
 
     /**
@@ -415,6 +444,97 @@ public class MicroGPT {
      */
     private void ppoInference() {
         ppoTrainer.generateSamples(NUM_SAMPLES, TEMPERATURE);
+    }
+
+    /**
+     * DPO 后训练（直接偏好优化阶段）
+     * 在预训练完成后，使用 DPO 算法进一步优化模型
+     */
+    private void dpoPostTrain() {
+        // 构建偏好数据：从训练数据中生成偏好对
+        List<DPOTrainer.PreferencePair> preferencePairs = generatePreferencePairs();
+
+        DPOTrainer.Config dpoConfig = new DPOTrainer.Config();
+        dpoConfig.epochs = DPO_EPOCHS;
+        dpoConfig.batchSize = DPO_BATCH_SIZE;
+        dpoConfig.beta = DPO_BETA;
+        dpoConfig.learningRate = DPO_LEARNING_RATE;
+
+        // 使用 PPO 训练后的模型进行 DPO
+        dpoTrainer = new DPOTrainer(model, tokenizer, dpoConfig);
+        dpoTrainer.train(preferencePairs);
+    }
+
+    /**
+     * DPO 后训练推理生成
+     * 展示 DPO 后训练后的模型生成效果
+     */
+    private void dpoInference() {
+        dpoTrainer.generateSamples(NUM_SAMPLES, TEMPERATURE);
+    }
+
+    /**
+     * 生成偏好数据对
+     * 基于规则奖励函数生成 chosen vs rejected 偏好对
+     */
+    private List<DPOTrainer.PreferencePair> generatePreferencePairs() {
+        List<DPOTrainer.PreferencePair> pairs = new ArrayList<>();
+        RewardFunction rewardFunction = new RewardFunction(docs);
+
+        // 使用当前模型生成样本，并根据奖励分数构造偏好对
+        int numSamples = 100;  // 生成样本数量
+        List<String> generated = new ArrayList<>();
+        List<Double> rewards = new ArrayList<>();
+
+        for (int i = 0; i < numSamples; i++) {
+            List<List<Value[]>> keys = model.initKVCache();
+            List<List<Value[]>> values = model.initKVCache();
+
+            int tokenId = tokenizer.getBOS();
+            StringBuilder output = new StringBuilder();
+
+            for (int posId = 0; posId < BLOCK_SIZE; posId++) {
+                Value[] logits = model.forward(tokenId, posId, keys, values);
+
+                Value[] scaledLogits = new Value[logits.length];
+                for (int j = 0; j < logits.length; j++) {
+                    scaledLogits[j] = logits[j].div(TEMPERATURE);
+                }
+
+                Value[] probs = model.softmax(scaledLogits);
+                tokenId = sampleFromProbs(probs);
+
+                if (tokenId == tokenizer.getBOS()) {
+                    break;
+                }
+                output.append(tokenizer.decode(tokenId));
+            }
+
+            String text = output.toString();
+            double reward = rewardFunction.score(text);
+
+            generated.add(text);
+            rewards.add(reward);
+        }
+
+        // 根据奖励分数构建偏好对（只取高/低分对比，避免组合爆炸）
+        // 按奖励排序
+        List<Integer> indices = new ArrayList<>();
+        for (int i = 0; i < generated.size(); i++) indices.add(i);
+        indices.sort((a, b) -> Double.compare(rewards.get(b), rewards.get(a)));
+
+        // 高分 vs 低分配对（最多取 min(高分组, 低分组) 个对）
+        int halfSize = indices.size() / 2;
+        for (int i = 0; i < halfSize; i++) {
+            int highIdx = indices.get(i);
+            int lowIdx = indices.get(indices.size() - 1 - i);
+            if (rewards.get(highIdx) > rewards.get(lowIdx)) {
+                pairs.add(new DPOTrainer.PreferencePair(generated.get(highIdx), generated.get(lowIdx)));
+            }
+        }
+
+        System.out.println("生成偏好数据对数量: " + pairs.size());
+        return pairs;
     }
 
     /**
