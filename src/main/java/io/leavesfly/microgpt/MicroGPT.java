@@ -40,7 +40,7 @@ public class MicroGPT {
     /**
      * 训练步数（每步包含 BATCH_SIZE 个样本的梯度累积）
      */
-    private static final int NUM_STEPS = 200;
+    private static final int NUM_STEPS = 100;
 
     /**
      * 梯度累积批次大小
@@ -57,72 +57,44 @@ public class MicroGPT {
      */
     private static final int NUM_SAMPLES = 20;
 
-    // ============ PPO 后训练超参数 ============
+    // ============ REINFORCE 后训练超参数 ============
 
     /**
-     * PPO 训练步数
+     * RL 训练步数
      */
-    private static final int PPO_STEPS = 200;
+    private static final int RL_STEPS = 50;
 
     /**
-     * 每步生成的 rollout 数量（越大梯度估计越准确）
+     * RL 每步采样的序列数量（用于估计基线和降低方差）
      */
-    private static final int PPO_ROLLOUTS_PER_STEP = 8;
+    private static final int RL_SAMPLE_SIZE = 8;
 
     /**
-     * PPO clip 范围 ε（控制每步更新幅度）
+     * RL 学习率（通常比预训练小）
      */
-    private static final double PPO_CLIP_EPSILON = 0.2;
+    private static final double RL_LEARNING_RATE = 5e-4;
 
     /**
-     * KL 散度惩罚系数 β（越小允许策略探索越多）
+     * KL 散度惩罚系数（防止策略偏离预训练分布太远）
      */
-    private static final double PPO_KL_COEFFICIENT = 0.05;
+    private static final double KL_PENALTY_COEFF = 0.3;
 
     /**
-     * PPO 学习率
+     * 梯度裁剪阈值（防止异常轨迹导致的梯度爆炸）
      */
-    private static final double PPO_LEARNING_RATE = 1e-3;
+    private static final double GRAD_CLIP_NORM = 1.0;
 
     /**
-     * PPO 推理温度
+     * Advantage 裁剪范围（限制单条轨迹的影响力）
      */
-    private static final double PPO_TEMPERATURE = 0.8;
-
-    /**
-     * Reference model 同步间隔
-     */
-    private static final int PPO_REF_SYNC_INTERVAL = 25;
-
-    // ============ DPO 后训练超参数 ============
-
-    /**
-     * DPO 训练轮数
-     */
-    private static final int DPO_EPOCHS = 100;
-
-    /**
-     * DPO 批次大小
-     */
-    private static final int DPO_BATCH_SIZE = 16;
-
-    /**
-     * DPO KL 惩罚系数 β
-     */
-    private static final double DPO_BETA = 0.1;
-
-    /**
-     * DPO 学习率
-     */
-    private static final double DPO_LEARNING_RATE = 5e-4;
+    private static final double ADVANTAGE_CLIP = 0.5;
 
     // ============ 核心组件 ============
 
     private Tokenizer tokenizer;
     private GPT model;
     private AdamOptimizer optimizer;
-    private PPOTrainer ppoTrainer;
-    private DPOTrainer dpoTrainer;
+    private AdamOptimizer rlOptimizer;
     private List<String> docs;
     private Random random;
 
@@ -164,20 +136,11 @@ public class MicroGPT {
         // 6. 训练模型
         train();
 
-        // 7. 预训练后推理生成
+        // 7. REINFORCE 后训练（强化学习微调）
+        reinforceFinetune();
+
+        // 8. 训练后推理生成
         inference();
-
-        // 8. PPO 后训练（强化学习）
-        ppoPostTrain();
-
-        // 9. PPO 后训练推理生成
-        ppoInference();
-
-        // 10. DPO 后训练（直接偏好优化）
-        dpoPostTrain();
-
-        // 11. DPO 后训练推理生成
-        dpoInference();
     }
 
     /**
@@ -304,6 +267,272 @@ public class MicroGPT {
         System.out.printf("%n训练完成！(耗时: %.1fs)%n", trainSeconds);
     }
 
+    // ============ REINFORCE 后训练 ============
+
+    /**
+     * REINFORCE 后训练 - 使用策略梯度优化模型
+     *
+     * 核心思想：生成序列 → 奖励函数打分 → 策略梯度更新
+     * loss = -(reward - baseline) × Σ log P(token_t)
+     */
+    private void reinforceFinetune() {
+        System.out.println("\n--- REINFORCE 后训练 ---");
+        System.out.printf("RL 步数: %d, 采样数: %d, 学习率: %.4f, KL 惩罚: %.2f, 梯度裁剪: %.1f%n%n",
+                RL_STEPS, RL_SAMPLE_SIZE, RL_LEARNING_RATE, KL_PENALTY_COEFF, GRAD_CLIP_NORM);
+
+        // 1. 保存预训练时的参考 logits（用于 KL 散度惩罚）
+        // 用一组固定的 token 序列来计算参考分布
+        double[][] referenceLogProbs = captureReferenceDistribution();
+
+        // 2. 初始化 RL 专用优化器（较小学习率，重置动量状态）
+        rlOptimizer = new AdamOptimizer(RL_LEARNING_RATE, 0.9, 0.95, 1e-8, model.getParams().size());
+
+        long rlStartTime = System.currentTimeMillis();
+        double smoothReward = -1;
+
+        for (int step = 0; step < RL_STEPS; step++) {
+            AdamOptimizer.zeroGrad(model.getParams());
+
+            double totalReward = 0;
+            double totalLossValue = 0;
+
+            // 收集多个轨迹的奖励，用于计算基线
+            double[] rewards = new double[RL_SAMPLE_SIZE];
+            List<List<Value>> allLogProbs = new ArrayList<>();
+            List<List<Integer>> allGeneratedTokens = new ArrayList<>();
+
+            // 第一遍：采样生成序列并计算奖励
+            for (int sampleIdx = 0; sampleIdx < RL_SAMPLE_SIZE; sampleIdx++) {
+                List<List<Value[]>> keys = model.initKVCache();
+                List<List<Value[]>> values = model.initKVCache();
+
+                int tokenId = tokenizer.getBOS();
+                List<Value> logProbs = new ArrayList<>();
+                List<Integer> generatedTokens = new ArrayList<>();
+
+                for (int posId = 0; posId < BLOCK_SIZE; posId++) {
+                    Value[] logits = model.forward(tokenId, posId, keys, values);
+                    Value[] probs = model.softmax(logits);
+
+                    // 采样下一个 token
+                    tokenId = sampleFromProbs(probs);
+
+                    if (tokenId == tokenizer.getBOS()) {
+                        break;
+                    }
+
+                    // 记录 log P(sampled_token) —— 保留在计算图中
+                    logProbs.add(probs[tokenId].log());
+                    generatedTokens.add(tokenId);
+                }
+
+                rewards[sampleIdx] = computeReward(generatedTokens);
+                allLogProbs.add(logProbs);
+                allGeneratedTokens.add(generatedTokens);
+                totalReward += rewards[sampleIdx];
+            }
+
+            // 计算基线（奖励均值），用于降低方差
+            double baseline = totalReward / RL_SAMPLE_SIZE;
+
+            // 第二遍：计算策略梯度 loss 并反向传播
+            for (int sampleIdx = 0; sampleIdx < RL_SAMPLE_SIZE; sampleIdx++) {
+                List<Value> logProbs = allLogProbs.get(sampleIdx);
+                if (logProbs.isEmpty()) {
+                    continue;
+                }
+
+                double advantage = rewards[sampleIdx] - baseline;
+
+                // 裁剪 advantage，防止异常轨迹主导梯度
+                advantage = Math.max(-ADVANTAGE_CLIP, Math.min(ADVANTAGE_CLIP, advantage));
+
+                // 策略梯度 loss = -(advantage) × Σ log P(token_t) / (序列长度 × 采样数)
+                Value loss = new Value(0);
+                for (Value logP : logProbs) {
+                    loss = loss.add(logP.mul(-advantage));
+                }
+
+                // KL 散度惩罚：鼓励模型不要偏离预训练分布太远
+                Value klPenalty = computeKLPenalty(allGeneratedTokens.get(sampleIdx),
+                        allLogProbs.get(sampleIdx), referenceLogProbs);
+                loss = loss.add(klPenalty.mul(KL_PENALTY_COEFF));
+
+                loss = loss.div(logProbs.size() * RL_SAMPLE_SIZE);
+                loss.backward();
+
+                totalLossValue += loss.data * RL_SAMPLE_SIZE;
+            }
+
+            // 梯度裁剪：防止梯度爆炸
+            clipGradNorm(model.getParams(), GRAD_CLIP_NORM);
+
+            // 更新参数
+            rlOptimizer.step(model.getParams(), step, RL_STEPS);
+
+            // 统计
+            double avgReward = totalReward / RL_SAMPLE_SIZE;
+            smoothReward = (smoothReward < 0) ? avgReward : 0.9 * smoothReward + 0.1 * avgReward;
+
+            if ((step + 1) % 10 == 0 || step == 0) {
+                System.out.printf("rl_step %3d / %3d | reward %.4f | smooth_reward %.4f | loss %.4f%n",
+                        step + 1, RL_STEPS, avgReward, smoothReward, totalLossValue / RL_SAMPLE_SIZE);
+            }
+        }
+
+        long rlEndTime = System.currentTimeMillis();
+        double rlSeconds = (rlEndTime - rlStartTime) / 1000.0;
+        System.out.printf("%nREINFORCE 后训练完成！(耗时: %.1fs)%n", rlSeconds);
+
+        // 展示 RL 后训练效果
+        System.out.println("\n--- RL 后训练推理 ---");
+        generateSamples(5);
+    }
+
+    /**
+     * 计算奖励函数
+     *
+     * 综合多个维度对生成序列打分：
+     * 1. 长度奖励：鼓励生成更长的有意义序列
+     * 2. 多样性奖励：惩罚字符重复
+     * 3. 合法性奖励：奖励生成合法的字母和空格组合
+     *
+     * @param generatedTokens 生成的 token 序列
+     * @return 奖励值
+     */
+    private double computeReward(List<Integer> generatedTokens) {
+        if (generatedTokens.isEmpty()) {
+            return -1.0;
+        }
+
+        double reward = 0.0;
+
+        // 解码为字符串
+        StringBuilder sb = new StringBuilder();
+        for (int tokenId : generatedTokens) {
+            sb.append(tokenizer.decode(tokenId));
+        }
+        String generated = sb.toString();
+
+        // 1. 长度奖励：鼓励生成接近 BLOCK_SIZE 的序列（归一化到 0~1）
+        double lengthReward = Math.min(1.0, (double) generated.length() / BLOCK_SIZE);
+        reward += lengthReward * 0.3;
+
+        // 2. 多样性奖励：唯一字符比例（归一化到 0~1）
+        Set<Character> uniqueChars = new HashSet<>();
+        for (char c : generated.toCharArray()) {
+            uniqueChars.add(c);
+        }
+        double diversityReward = (double) uniqueChars.size() / Math.max(1, generated.length());
+        reward += diversityReward * 0.3;
+
+        // 3. 合法性奖励：字母和空格的比例
+        int validCharCount = 0;
+        for (char c : generated.toCharArray()) {
+            if (Character.isLetter(c) || c == ' ' || c == '\'' || c == '-') {
+                validCharCount++;
+            }
+        }
+        double validityReward = (double) validCharCount / Math.max(1, generated.length());
+        reward += validityReward * 0.2;
+
+        // 4. 连续性奖励：惩罚连续重复字符（如 "aaaa"）
+        int repeatPenaltyCount = 0;
+        for (int i = 1; i < generated.length(); i++) {
+            if (generated.charAt(i) == generated.charAt(i - 1)) {
+                repeatPenaltyCount++;
+            }
+        }
+        double repeatPenalty = 1.0 - (double) repeatPenaltyCount / Math.max(1, generated.length() - 1);
+        reward += repeatPenalty * 0.2;
+
+        return reward;
+    }
+
+    /**
+     * 捕获预训练模型的参考分布
+     * 用固定的 BOS 起始，记录每个位置的 log 概率分布
+     *
+     * @return 参考 log 概率矩阵 [position][vocabSize]
+     */
+    private double[][] captureReferenceDistribution() {
+        double[][] refLogProbs = new double[BLOCK_SIZE][model.getVocabSize()];
+
+        List<List<Value[]>> keys = model.initKVCache();
+        List<List<Value[]>> values = model.initKVCache();
+
+        int tokenId = tokenizer.getBOS();
+        for (int posId = 0; posId < BLOCK_SIZE; posId++) {
+            Value[] logits = model.forward(tokenId, posId, keys, values);
+            Value[] probs = model.softmax(logits);
+
+            for (int v = 0; v < model.getVocabSize(); v++) {
+                refLogProbs[posId][v] = Math.log(Math.max(probs[v].data, 1e-10));
+            }
+
+            // 用 argmax 选择下一个 token（确定性参考路径）
+            tokenId = 0;
+            double maxProb = -1;
+            for (int v = 0; v < probs.length; v++) {
+                if (probs[v].data > maxProb) {
+                    maxProb = probs[v].data;
+                    tokenId = v;
+                }
+            }
+        }
+
+        return refLogProbs;
+    }
+
+    /**
+     * 计算 KL 散度惩罚
+     * KL(π_current || π_ref) ≈ Σ [log π_current(a_t) - log π_ref(a_t)]
+     *
+     * @param generatedTokens 生成的 token 序列
+     * @param currentLogProbs 当前策略的 log 概率（Value 类型，在计算图中）
+     * @param referenceLogProbs 参考分布的 log 概率
+     * @return KL 惩罚值（Value 类型，支持反向传播）
+     */
+    private Value computeKLPenalty(List<Integer> generatedTokens,
+                                   List<Value> currentLogProbs,
+                                   double[][] referenceLogProbs) {
+        Value klDivergence = new Value(0);
+
+        int length = Math.min(generatedTokens.size(), currentLogProbs.size());
+        for (int t = 0; t < length && t < BLOCK_SIZE; t++) {
+            int tokenId = generatedTokens.get(t);
+            Value currentLogP = currentLogProbs.get(t);
+            double refLogP = referenceLogProbs[t][tokenId];
+
+            // KL ≈ log π_current - log π_ref
+            klDivergence = klDivergence.add(currentLogP.sub(refLogP));
+        }
+
+        return klDivergence;
+    }
+
+    /**
+     * 梯度裁剪（L2 范数裁剪）
+     * 当梯度的 L2 范数超过阈值时，按比例缩小所有梯度
+     *
+     * @param params 模型参数列表
+     * @param maxNorm 最大梯度范数
+     */
+    private void clipGradNorm(List<Value> params, double maxNorm) {
+        double totalNormSquared = 0;
+        for (Value p : params) {
+            totalNormSquared += p.grad * p.grad;
+        }
+        double totalNorm = Math.sqrt(totalNormSquared);
+
+        if (totalNorm > maxNorm) {
+            double scale = maxNorm / totalNorm;
+            for (Value p : params) {
+                p.grad *= scale;
+            }
+        }
+    }
+
     /**
      * 推理生成
      */
@@ -416,125 +645,6 @@ public class MicroGPT {
 
             System.out.printf("sample %2d: %s%n", sampleIdx + 1, output.toString());
         }
-    }
-
-    /**
-     * PPO 后训练（强化学习阶段）
-     * 在预训练完成后，使用 PPO 算法进一步优化模型
-     */
-    private void ppoPostTrain() {
-        RewardFunction rewardFunction = new RewardFunction(docs);
-
-        PPOTrainer.Config ppoConfig = new PPOTrainer.Config();
-        ppoConfig.ppoSteps = PPO_STEPS;
-        ppoConfig.rolloutsPerStep = PPO_ROLLOUTS_PER_STEP;
-        ppoConfig.clipEpsilon = PPO_CLIP_EPSILON;
-        ppoConfig.klCoefficient = PPO_KL_COEFFICIENT;
-        ppoConfig.learningRate = PPO_LEARNING_RATE;
-        ppoConfig.temperature = PPO_TEMPERATURE;
-        ppoConfig.refSyncInterval = PPO_REF_SYNC_INTERVAL;
-
-        ppoTrainer = new PPOTrainer(model, rewardFunction, tokenizer, ppoConfig);
-        ppoTrainer.train();
-    }
-
-    /**
-     * PPO 后训练推理生成
-     * 展示 PPO 后训练后的模型生成效果
-     */
-    private void ppoInference() {
-        ppoTrainer.generateSamples(NUM_SAMPLES, TEMPERATURE);
-    }
-
-    /**
-     * DPO 后训练（直接偏好优化阶段）
-     * 在预训练完成后，使用 DPO 算法进一步优化模型
-     */
-    private void dpoPostTrain() {
-        // 构建偏好数据：从训练数据中生成偏好对
-        List<DPOTrainer.PreferencePair> preferencePairs = generatePreferencePairs();
-
-        DPOTrainer.Config dpoConfig = new DPOTrainer.Config();
-        dpoConfig.epochs = DPO_EPOCHS;
-        dpoConfig.batchSize = DPO_BATCH_SIZE;
-        dpoConfig.beta = DPO_BETA;
-        dpoConfig.learningRate = DPO_LEARNING_RATE;
-
-        // 使用 PPO 训练后的模型进行 DPO
-        dpoTrainer = new DPOTrainer(model, tokenizer, dpoConfig);
-        dpoTrainer.train(preferencePairs);
-    }
-
-    /**
-     * DPO 后训练推理生成
-     * 展示 DPO 后训练后的模型生成效果
-     */
-    private void dpoInference() {
-        dpoTrainer.generateSamples(NUM_SAMPLES, TEMPERATURE);
-    }
-
-    /**
-     * 生成偏好数据对
-     * 基于规则奖励函数生成 chosen vs rejected 偏好对
-     */
-    private List<DPOTrainer.PreferencePair> generatePreferencePairs() {
-        List<DPOTrainer.PreferencePair> pairs = new ArrayList<>();
-        RewardFunction rewardFunction = new RewardFunction(docs);
-
-        // 使用当前模型生成样本，并根据奖励分数构造偏好对
-        int numSamples = 100;  // 生成样本数量
-        List<String> generated = new ArrayList<>();
-        List<Double> rewards = new ArrayList<>();
-
-        for (int i = 0; i < numSamples; i++) {
-            List<List<Value[]>> keys = model.initKVCache();
-            List<List<Value[]>> values = model.initKVCache();
-
-            int tokenId = tokenizer.getBOS();
-            StringBuilder output = new StringBuilder();
-
-            for (int posId = 0; posId < BLOCK_SIZE; posId++) {
-                Value[] logits = model.forward(tokenId, posId, keys, values);
-
-                Value[] scaledLogits = new Value[logits.length];
-                for (int j = 0; j < logits.length; j++) {
-                    scaledLogits[j] = logits[j].div(TEMPERATURE);
-                }
-
-                Value[] probs = model.softmax(scaledLogits);
-                tokenId = sampleFromProbs(probs);
-
-                if (tokenId == tokenizer.getBOS()) {
-                    break;
-                }
-                output.append(tokenizer.decode(tokenId));
-            }
-
-            String text = output.toString();
-            double reward = rewardFunction.score(text);
-
-            generated.add(text);
-            rewards.add(reward);
-        }
-
-        // 根据奖励分数构建偏好对（只取高/低分对比，避免组合爆炸）
-        // 按奖励排序
-        List<Integer> indices = new ArrayList<>();
-        for (int i = 0; i < generated.size(); i++) indices.add(i);
-        indices.sort((a, b) -> Double.compare(rewards.get(b), rewards.get(a)));
-
-        // 高分 vs 低分配对（最多取 min(高分组, 低分组) 个对）
-        int halfSize = indices.size() / 2;
-        for (int i = 0; i < halfSize; i++) {
-            int highIdx = indices.get(i);
-            int lowIdx = indices.get(indices.size() - 1 - i);
-            if (rewards.get(highIdx) > rewards.get(lowIdx)) {
-                pairs.add(new DPOTrainer.PreferencePair(generated.get(highIdx), generated.get(lowIdx)));
-            }
-        }
-
-        System.out.println("生成偏好数据对数量: " + pairs.size());
-        return pairs;
     }
 
     /**
